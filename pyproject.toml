@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "arcee"
+version = "0.1.0"
+description = "Parsing / hashing NNs playbook (encoders, decoders, transformers)."
+authors = ["axdg <axdg@dfant.asia>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "^1.13.1"
+torchtext = "^0.14.1"
+torchdata = "^0.5.1"
+duckdb = "^0.7.0"
+pyarrow = "^11.0.0"
+polars = "^0.16.8"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.1.0"
+pylint = "^2.16.2"
+taskipy = "^1.10.3"
+
+[tool.taskipy.tasks]
+dev = "uvicorn app.main:app --reload"
+test = "pytest -s app"
+lint = "poetry run pylint -j 4 -r n app bin"
+format = "black ."
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
