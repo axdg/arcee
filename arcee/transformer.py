@@ -1,36 +1,24 @@
 import math
-from typing import Iterable, List
-
-from timeit import default_timer as timer
-
-import torch
-import torch.nn as nn
-from torch import Tensor
-from torch.utils.data import DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from torch.nn import Transformer
-
+from functools import reduce, partial
+from typing import Callable, Any, ClassVar
+from unicodedata import normalize
+from pathlib import Path
 from dataclasses import dataclass, asdict
 from textwrap import dedent
 from datetime import date
 import random
 import string
 
-from typing import ClassVar
-
-import pyarrow
-import polars as pl
-
-import duckdb
-from duckdb import DuckDBPyConnection
+from timeit import default_timer as timer
 
 import torch
+from torch import nn, Tensor
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn import Transformer
 from torch.utils.data import DataLoader, Dataset
 
-from functools import reduce, partial
-from typing import Callable, Any
-from torch.nn.utils.rnn import pad_sequence
-from unicodedata import normalize
+import polars as pl
+import duckdb
 
 
 class CharacterTokenizer:
@@ -53,7 +41,7 @@ class CharacterTokenizer:
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, emb_size: int, dropout: float, maxlen: int = 5000):
+    def __init__(self, emb_size: int, dropout: float, maxlen: int = 64):
         super(PositionalEncoding, self).__init__()
         den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
@@ -163,7 +151,9 @@ class DateParsingTransformer(nn.Module):
         src_seq_len = src.shape[0]
         tgt_seq_len = tgt.shape[0]
 
-        tgt_mask = DateParsingTransformer.generate_square_subsequent_mask(tgt_seq_len, device)
+        tgt_mask = DateParsingTransformer.generate_square_subsequent_mask(
+            tgt_seq_len, device
+        )
         src_mask = torch.zeros((src_seq_len, src_seq_len), device=device).type(
             torch.bool
         )
@@ -267,11 +257,11 @@ def evaluate(
 
 @dataclass
 class DateParsingTransformerConfig:
-    num_encoder_layers: int = 3
-    num_decoder_layers: int = 3
-    emb_size: int = 192
+    num_encoder_layers: int = 2
+    num_decoder_layers: int = 2
+    emb_size: int = 96
     nhead: int = 3
-    dim_feedforward: int = 128
+    dim_feedforward: int = 64
     dropout: float = 0.1
     src_vocab_size: int = 10
     tgt_vocab_size: int = 10
@@ -290,12 +280,14 @@ class RandomDateDataset(Dataset):
         "%d/%m/%Y",
         "%d-%m-%Y",
         "%d.%m.%Y",
-        "%m/%d/%Y",
-        "%m-%d-%Y",
-        "%m.%d.%Y",
+        "%a %d/%m/%Y",
+        "%a %d-%m-%Y",
+        "%a %d.%m.%Y",
+        "%A %d/%m/%Y",
+        "%A %d-%m-%Y",
+        "%A %d.%m.%Y",
         "%A, %d %B %Y",
         "%A, %B %d %Y",
-        "%a, %d %d %Y",
         "%a, %B %d %Y",
         "%A %d %B %Y",
         "%A %B %d %Y",
@@ -353,7 +345,7 @@ class RandomDateDataset(Dataset):
                     pl.col("d")
                     .apply(lambda d: d.strftime(random.choice(self.DATE_FORMATS)))
                     .alias("x"),
-                    pl.col("d").dt.strftime(fmt="%Y-%m-%d|%w").alias("y"),
+                    pl.col("d").dt.strftime(fmt="%Y-%m-%d").alias("y"),
                 ]
             )
 
@@ -406,6 +398,12 @@ def create_tensor(v: list[int], bos_idx: str, eos_idx: str) -> torch.Tensor:
     )
 
 
+DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+STATE_DICT_PATH = DATA_DIR / "dpt.pt"
+STATE_DICT_PATH_NEXT = DATA_DIR / "dpt-next.pt"
+
+
 def main(num_epochs: int = 18, batch_size: int = 128):
     torch.manual_seed(42)
 
@@ -417,11 +415,11 @@ def main(num_epochs: int = 18, batch_size: int = 128):
 
     CHARACTERS = "!:@|" + string.ascii_uppercase + string.digits + " -.,/\\"
 
-    # TODO(@axdg): We could probably make the parameter on the tokenizer.
+    # TODO(@axdg): We could probably make this a parameter on the tokenizer
+    # or the model instance.
     PAD_IDX = CHARACTERS.index("!")
     BOS_IDX = CHARACTERS.index(":")
     EOS_IDX = CHARACTERS.index("@")
-    SEP_IDX = CHARACTERS.index("|")
 
     tokenizer = CharacterTokenizer(CHARACTERS)
 
@@ -446,23 +444,84 @@ def main(num_epochs: int = 18, batch_size: int = 128):
     )
 
     transformer = DateParsingTransformer(**asdict(config))
-    transformer.init_weights()
 
-    optimizer = torch.optim.Adam(transformer.parameters(), **asdict(AdamConfig()))
+    # TODO(@axdg): Replace this with something better (a method on the original
+    # class). Or just something better like `transformer.init_weights()`.
+    transformer.load_state_dict(torch.load(STATE_DICT_PATH))
+
+    # TODO(@axdg): This was originally train with:
+    # ```
+    # optimizer = torch.optim.Adam(transformer.parameters(), **asdict(AdamConfig()))
+    # ```
+    # Consider switching back to that (or experiment more).
+    optimizer = torch.optim.RMSprop(
+        transformer.parameters(),
+        lr=0.0001,
+        alpha=0.99,
+        eps=1e-08,
+        weight_decay=0,
+        momentum=0,
+        centered=False,
+    )
+
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
-    train_dataset = RandomDateDataset(size=20_000)
+    train_dataset = RandomDateDataset(size=50_000)
     train_dataloader = DataLoader(
         train_dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True
     )
 
-    val_dataset = RandomDateDataset(size=1000)
+    val_dataset = RandomDateDataset(size=3000)
     val_dataloader = DataLoader(
         val_dataset, batch_size=batch_size, collate_fn=collate_fn
     )
 
     transformer = transformer.to(DEVICE)
     criterion = criterion.to(DEVICE)
+
+    def greedy_decode(model: nn.Module, src, src_mask, max_len, bos_idx):
+        src = src.to(DEVICE)
+        src_mask = src_mask.to(DEVICE)
+
+        memory = model.encode(src, src_mask)
+        ys = torch.ones(1, 1).fill_(bos_idx).type(torch.long).to(DEVICE)
+
+        for _ in range(max_len - 1):
+            memory = memory.to(DEVICE)
+            tgt_mask = (
+                DateParsingTransformer.generate_square_subsequent_mask(
+                    ys.size(0), DEVICE
+                ).type(torch.bool)
+            ).to(DEVICE)
+
+            out = model.decode(ys, memory, tgt_mask)
+            out = out.transpose(0, 1)
+
+            prob = model.generator(out[:, -1])
+            _, next_word = torch.max(prob, dim=1)
+
+            next_word = next_word.item()
+
+            ys = torch.cat(
+                [ys, torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=0
+            )
+            if next_word == EOS_IDX:
+                break
+        return ys
+
+    def translate(model: nn.Module, src_sentence: str):
+        model.eval()
+        src = transform_text_to_sequence(src_sentence).view(-1, 1)
+        num_tokens = src.shape[0]
+        src_mask = (torch.zeros(num_tokens, num_tokens)).type(torch.bool)
+        tgt_tokens = greedy_decode(
+            model, src, src_mask, max_len=num_tokens + 5, bos_idx=BOS_IDX
+        ).flatten()
+
+        tgt_chars = tokenizer.untokenize(list(tgt_tokens.cpu().numpy()))
+        return "".join(tgt_chars).replace(":", "").replace("@", "")
+
+    TEST_DATES = [date.today().strftime(f) for f in RandomDateDataset.DATE_FORMATS]
 
     for epoch in range(num_epochs):
         start_time = timer()
@@ -480,7 +539,7 @@ def main(num_epochs: int = 18, batch_size: int = 128):
         val_loss = evaluate(
             model=transformer,
             criterion=criterion,
-            dataloader=train_dataloader,
+            dataloader=val_dataloader,
             pad_idx=PAD_IDX,
             device=DEVICE,
         )
@@ -492,6 +551,23 @@ def main(num_epochs: int = 18, batch_size: int = 128):
             )
         )
 
+        d: str
+        for d in TEST_DATES:
+            s = timer()
+            p = translate(transformer, d).strip()
+            e = timer()
 
-if __name__ == main():
-    main(num_epochs=3, batch_size=256)
+            c = p == date.today().strftime("%Y-%m-%d")
+
+            print(
+                d.ljust(36, " "),
+                p.ljust(15, " "),
+                " Y " if c else " N ",
+                f"{math.floor(((e - s) * 1000))}ms".ljust(10, " "),
+            )
+
+        torch.save(transformer.state_dict(), STATE_DICT_PATH_NEXT)
+
+
+if __name__ == "__main__":
+    main(num_epochs=20, batch_size=128)
