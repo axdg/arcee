@@ -14,8 +14,13 @@ from timeit import default_timer as timer
 import torch
 from torch import nn, Tensor
 from torch.nn.utils.rnn import pad_sequence
-from torch.nn import Transformer
 from torch.utils.data import DataLoader, Dataset
+from torch.nn import (
+    TransformerEncoder,
+    TransformerDecoder,
+    TransformerEncoderLayer,
+    TransformerDecoderLayer,
+)
 
 import polars as pl
 import duckdb
@@ -42,7 +47,8 @@ class CharacterTokenizer:
 
 class PositionalEncoding(nn.Module):
     def __init__(self, emb_size: int, dropout: float, maxlen: int = 64):
-        super(PositionalEncoding, self).__init__()
+        super().__init__()
+
         den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
         pos = torch.arange(0, maxlen).reshape(maxlen, 1)
         pos_embedding = torch.zeros((maxlen, emb_size))
@@ -61,12 +67,26 @@ class PositionalEncoding(nn.Module):
 
 class TokenEmbedding(nn.Module):
     def __init__(self, vocab_size: int, emb_size):
-        super(TokenEmbedding, self).__init__()
+        super().__init__()
+
         self.embedding = nn.Embedding(vocab_size, emb_size)
         self.emb_size = emb_size
 
     def forward(self, tokens: Tensor):
         return self.embedding(tokens.long()) * math.sqrt(self.emb_size)
+
+
+@dataclass
+class DateParsingTransformerConfig:  # pylint: disable=too-many-instance-attributes
+    num_encoder_layers: int = 2
+    num_decoder_layers: int = 2
+    emb_size: int = 32
+    nhead: int = 4
+    dim_feedforward: int = 32
+    dropout: float = 0.1
+    src_vocab_size: int = 10
+    tgt_vocab_size: int = 10
+    dropout: float = 0.1
 
 
 class DateParsingTransformer(nn.Module):
@@ -78,18 +98,30 @@ class DateParsingTransformer(nn.Module):
         nhead: int,
         src_vocab_size: int,
         tgt_vocab_size: int,
-        dim_feedforward: int = 512,
-        dropout: float = 0.1,
+        dim_feedforward: int,
+        dropout: float,
     ):
-        super(DateParsingTransformer, self).__init__()
-        self.transformer = Transformer(
+        super().__init__()
+        # TODO(@axdg): Add a property that will allow us to retrieve a
+        # "device" - so that we don't need to constantly pass it around.
+
+        encoder_layer = TransformerEncoderLayer(
+            # TODO(@axdg): Rename this parameter to `d_model` in order to
+            # be consistent with the original paper / the PyTorch implementation.
             d_model=emb_size,
             nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
-            dropout=dropout,
         )
+
+        self.encoder = TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        decoder_layer = TransformerDecoderLayer(
+            d_model=emb_size,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+        )
+
+        self.decoder = TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         self.generator = nn.Linear(emb_size, tgt_vocab_size)
         self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
@@ -106,18 +138,29 @@ class DateParsingTransformer(nn.Module):
         tgt_padding_mask: Tensor,
         memory_key_padding_mask: Tensor,
     ):
+        # TODO(@axdg): Several things:
+        #   - The "encodings" should actually be called `positional_embedding`s.
+        #     The class name for these should be `PositionalEmbedding`.
+        #   - We need to create a method for checking the number of parameters.
+        #   - We need to add a method for finding the correct "device".
+        #   - We need to nicely handle keyboard interrupts, and add methods
+        #     for actually testing these functions out.
+        #   - We need to add a method for saving the model.
+        #   - We need to add a method for loading the model.
+        #   - We need to add the tokenizer padding tokens as a method on this
+        #     class.
+        #   - We need to add a method for initializing weights.
+        #   - We need to replace the custom `generate_square_subsequent_mask`
+        #     with the one that exists as a static method on the `Transformer`
+        #     class that PyTorch provides.
         src_emb = self.positional_encoding(self.src_tok_emb(src))
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
-        outs = self.transformer(
-            src_emb,
-            tgt_emb,
-            src_mask,
-            tgt_mask,
-            None,
-            src_padding_mask,
-            tgt_padding_mask,
-            memory_key_padding_mask,
+
+        memory = self.encoder(src_emb, src_mask, src_padding_mask)
+        outs = self.decoder(
+            tgt_emb, memory, tgt_mask, None, tgt_padding_mask, memory_key_padding_mask
         )
+
         return self.generator(outs)
 
     def init_weights(self):
@@ -126,17 +169,17 @@ class DateParsingTransformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def encode(self, src: Tensor, src_mask: Tensor):
-        return self.transformer.encoder(
-            self.positional_encoding(self.src_tok_emb(src)), src_mask
-        )
+        return self.encoder(self.positional_encoding(self.src_tok_emb(src)), src_mask)
 
     def decode(self, tgt: Tensor, memory: Tensor, tgt_mask: Tensor):
-        return self.transformer.decoder(
+        return self.decoder(
             self.positional_encoding(self.tgt_tok_emb(tgt)), memory, tgt_mask
         )
 
     @staticmethod
     def generate_square_subsequent_mask(sz: int, device):
+        # TODO(@axdg): This method appears to exist as a static method of
+        # `torch.nn.Transformer` - so we should probably use that instead.
         mask = (torch.triu(torch.ones((sz, sz), device=device)) == 1).transpose(0, 1)
         mask = (
             mask.float()
@@ -148,6 +191,10 @@ class DateParsingTransformer(nn.Module):
 
     @staticmethod
     def create_mask(src: Tensor, tgt: Tensor, pad_idx: int, device):
+        # TODO(@axdg): This is not aptly named - and it won't suite our
+        # purpose in a context where we're wanting to use multiple
+        # decoders. We should split this into two functions for the src and
+        # target masks.
         src_seq_len = src.shape[0]
         tgt_seq_len = tgt.shape[0]
 
@@ -256,22 +303,20 @@ def evaluate(
 
 
 @dataclass
-class DateParsingTransformerConfig:
-    num_encoder_layers: int = 2
-    num_decoder_layers: int = 2
-    emb_size: int = 96
-    nhead: int = 3
-    dim_feedforward: int = 64
-    dropout: float = 0.1
-    src_vocab_size: int = 10
-    tgt_vocab_size: int = 10
-
-
-@dataclass
 class AdamConfig:
     lr: float = 0.0001
     betas: tuple[float, float] = (0.9, 0.98)
     eps: float = 1e-9
+
+
+@dataclass
+class RMSpropConfig:
+    lr: float = 0.0001
+    alpha: float = 0.99
+    eps: float = 1e-08
+    weight_decay: float = 0
+    momentum: float = 0
+    centered: bool = False
 
 
 @dataclass
@@ -339,7 +384,7 @@ class RandomDateDataset(Dataset):
                 end_date=str(self.end_date),
             )
 
-            df = duckdb.sql(query=SCRIPT).pl()
+            df = duckdb.sql(query=SCRIPT).pl()  # pylint: disable=c-extension-no-member
             df = df.select(
                 [
                     pl.col("d")
@@ -384,7 +429,8 @@ def preprocess_text(text: str) -> str:
     # duplicated spaces etc.
     """
     text = normalize("NFC", text)
-    text = text.upper().strip()
+    text = text.upper()
+    text = text.strip()
     return text
 
 
@@ -405,6 +451,8 @@ STATE_DICT_PATH_NEXT = DATA_DIR / "dpt-next.pt"
 
 
 def main(num_epochs: int = 18, batch_size: int = 128):
+    # TODO(@axdg): This whole thing needs to be broken up into a bunch
+    # of different functions.
     torch.manual_seed(42)
 
     DEVICE = (
@@ -447,22 +495,18 @@ def main(num_epochs: int = 18, batch_size: int = 128):
 
     # TODO(@axdg): Replace this with something better (a method on the original
     # class). Or just something better like `transformer.init_weights()`.
-    transformer.load_state_dict(torch.load(STATE_DICT_PATH))
+    transformer.load_state_dict(torch.load(STATE_DICT_PATH_NEXT))
 
     # TODO(@axdg): This was originally train with:
     # ```
-    # optimizer = torch.optim.Adam(transformer.parameters(), **asdict(AdamConfig()))
+    # optimizer = torch.optim.RMSprop(
+    #     transformer.parameters(),
+    #     **asdict(RMSpropConfig()),
+    # )
     # ```
     # Consider switching back to that (or experiment more).
-    optimizer = torch.optim.RMSprop(
-        transformer.parameters(),
-        lr=0.0001,
-        alpha=0.99,
-        eps=1e-08,
-        weight_decay=0,
-        momentum=0,
-        centered=False,
-    )
+
+    optimizer = torch.optim.Adam(transformer.parameters(), **asdict(AdamConfig()))
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 

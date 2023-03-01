@@ -22,7 +22,7 @@ taskipy = "^1.10.3"
 [tool.taskipy.tasks]
 dev = "uvicorn app.main:app --reload"
 test = "pytest -s app"
-lint = "poetry run pylint -j 4 -r n app bin"
+lint = "poetry run pylint -j 4 -r n arcee"
 format = "black ."
 
 [build-system]
