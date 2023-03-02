@@ -1,6 +1,6 @@
 import math
-from functools import reduce, partial
-from typing import Callable, Any, ClassVar
+from functools import cached_property, reduce, partial
+from typing import Callable, Any, ClassVar, Optional
 from unicodedata import normalize
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -30,13 +30,7 @@ class CharacterTokenizer:
     def __init__(self, text: str):
         self.char_to_idx = {char: idx for idx, char in enumerate(text)}
         self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
-
-    def __len__(self):
-        return len(self.char_to_idx)
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self)
+        self.vocab_size = len(self.char_to_idx)
 
     def tokenize(self, text: str):
         return [self.char_to_idx[char] for char in text]
@@ -83,10 +77,10 @@ class DateParsingTransformerConfig:  # pylint: disable=too-many-instance-attribu
     emb_size: int = 32
     nhead: int = 4
     dim_feedforward: int = 32
-    dropout: float = 0.1
-    src_vocab_size: int = 10
-    tgt_vocab_size: int = 10
-    dropout: float = 0.1
+    vocab_size: Optional[int] = None
+    src_vocab_size: Optional[int] = None
+    tgt_vocab_size: Optional[int] = None
+    dropout: Optional[float] = 0.1
 
 
 class DateParsingTransformer(nn.Module):
@@ -96,14 +90,21 @@ class DateParsingTransformer(nn.Module):
         num_decoder_layers: int,
         emb_size: int,
         nhead: int,
+        dim_feedforward: int,
+        vocab_size: int,
         src_vocab_size: int,
         tgt_vocab_size: int,
-        dim_feedforward: int,
         dropout: float,
     ):
         super().__init__()
         # TODO(@axdg): Add a property that will allow us to retrieve a
         # "device" - so that we don't need to constantly pass it around.
+        src_vocab_size = tgt_vocab_size or vocab_size
+        tgt_vocab_size = tgt_vocab_size or vocab_size
+
+        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
+        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
+        self.positional_encoding = PositionalEncoding(emb_size, dropout=dropout)
 
         encoder_layer = TransformerEncoderLayer(
             # TODO(@axdg): Rename this parameter to `d_model` in order to
@@ -122,11 +123,25 @@ class DateParsingTransformer(nn.Module):
         )
 
         self.decoder = TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
-
         self.generator = nn.Linear(emb_size, tgt_vocab_size)
-        self.src_tok_emb = TokenEmbedding(src_vocab_size, emb_size)
-        self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, emb_size)
-        self.positional_encoding = PositionalEncoding(emb_size, dropout=dropout)
+
+    @cached_property
+    @staticmethod
+    def device():
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+
+        return torch.device("cpu")
+
+    @cached_property
+    def size(self):
+        return (
+            sum(p.numel() for p in self.parameters()),
+            sum(p.numel() for p in self.parameters() if p.requires_grad),
+        )
 
     def forward(
         self,
@@ -139,18 +154,16 @@ class DateParsingTransformer(nn.Module):
         memory_key_padding_mask: Tensor,
     ):
         # TODO(@axdg): Several things:
-        #   - The "encodings" should actually be called `positional_embedding`s.
+        #   - [ ] The "encodings" should actually be called `positional_embedding`s.
         #     The class name for these should be `PositionalEmbedding`.
-        #   - We need to create a method for checking the number of parameters.
-        #   - We need to add a method for finding the correct "device".
-        #   - We need to nicely handle keyboard interrupts, and add methods
+        #   - [ ] We need to nicely handle keyboard interrupts, and add methods
         #     for actually testing these functions out.
-        #   - We need to add a method for saving the model.
-        #   - We need to add a method for loading the model.
-        #   - We need to add the tokenizer padding tokens as a method on this
+        #   - [ ] We need to add a method for saving the model.
+        #   - [x] ~We need to add a method for loading the model; done - this one
+        #     is done at weight initialization.~
+        #   - [ ] We need to add the tokenizer padding tokens as a method on this
         #     class.
-        #   - We need to add a method for initializing weights.
-        #   - We need to replace the custom `generate_square_subsequent_mask`
+        #   - [ ] We need to replace the custom `generate_square_subsequent_mask`
         #     with the one that exists as a static method on the `Transformer`
         #     class that PyTorch provides.
         src_emb = self.positional_encoding(self.src_tok_emb(src))
@@ -163,7 +176,8 @@ class DateParsingTransformer(nn.Module):
 
         return self.generator(outs)
 
-    def init_weights(self):
+    def initialize_weights(self, path: Path = None):
+        # TODO(@axdg): This should also allow for initialization from a file.
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
@@ -488,7 +502,7 @@ def main(num_epochs: int = 18, batch_size: int = 128):
         return _pad_sequence(x), _pad_sequence(y)
 
     config = DateParsingTransformerConfig(
-        src_vocab_size=len(tokenizer), tgt_vocab_size=len(tokenizer)
+        vocab_size=tokenizer.vocab_size,
     )
 
     transformer = DateParsingTransformer(**asdict(config))
