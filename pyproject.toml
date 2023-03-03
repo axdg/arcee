@@ -6,13 +6,20 @@ authors = ["axdg <axdg@dfant.asia>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.12"
 torch = "^1.13.1"
 torchtext = "^0.14.1"
 torchdata = "^0.5.1"
 duckdb = "^0.7.0"
 pyarrow = "^11.0.0"
 polars = "^0.16.8"
+
+[tool.poetry.group.arm.dependencies]
+tensorflow-macos = "^2.11.0"
+tensorflow-metal = "^0.7.1"
+
+[tool.poetry.group.tfp.dependencies]
+tensorflow-probability = "^0.19.0"
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.1.0"

@@ -469,11 +469,13 @@ def main(num_epochs: int = 18, batch_size: int = 128):
     # of different functions.
     torch.manual_seed(42)
 
-    DEVICE = (
+    DEVICE = ( # TODO(@axdg): Switch to using `transformer.device`.
         torch.device("mps")
         if torch.backends.mps.is_available()
         else torch.device("cpu")
     )
+
+    print(DEVICE)
 
     CHARACTERS = "!:@|" + string.ascii_uppercase + string.digits + " -.,/\\"
 
@@ -509,7 +511,8 @@ def main(num_epochs: int = 18, batch_size: int = 128):
 
     # TODO(@axdg): Replace this with something better (a method on the original
     # class). Or just something better like `transformer.init_weights()`.
-    transformer.load_state_dict(torch.load(STATE_DICT_PATH_NEXT))
+    # transformer.load_state_dict(torch.load(STATE_DICT_PATH_NEXT))
+    transformer.initialize_weights()
 
     # TODO(@axdg): This was originally train with:
     # ```
@@ -624,8 +627,8 @@ def main(num_epochs: int = 18, batch_size: int = 128):
                 f"{math.floor(((e - s) * 1000))}ms".ljust(10, " "),
             )
 
-        torch.save(transformer.state_dict(), STATE_DICT_PATH_NEXT)
+        torch.save(transformer.state_dict(), STATE_DICT_PATH)
 
 
 if __name__ == "__main__":
-    main(num_epochs=20, batch_size=128)
+    main(num_epochs=100, batch_size=128)
